@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release version (e.g. 1.0.0 — without v prefix)'
+        required: true
+        type: string
+
+env:
+  DOTNET_NOLOGO: true
+  DOTNET_CLI_TELEMETRY_OPTOUT: true
+
+jobs:
+  release:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Validate Version
+        shell: pwsh
+        run: |
+          if ("${{ inputs.version }}" -notmatch '^[0-9]+\.[0-9]+\.[0-9]+$') {
+            throw "Version must be semver format (e.g. 1.0.0)"
+          }
+          # Ensure tag doesn't already exist
+          $existing = git ls-remote --tags origin "refs/tags/v${{ inputs.version }}"
+          if ($existing) { throw "Tag v${{ inputs.version }} already exists" }
+          Write-Host "✓ Version v${{ inputs.version }} available"
+
+      - name: Restore
+        run: dotnet restore DnsChangerLite.sln
+
+      - name: Build Tests
+        run: dotnet build tests/DnsChangerLite.Tests/DnsChangerLite.Tests.csproj -c Release --no-restore
+
+      - name: Run Tests
+        run: dotnet test tests/DnsChangerLite.Tests/DnsChangerLite.Tests.csproj -c Release --no-build
+
+      - name: Build Application
+        run: dotnet build src/DnsChangerLite/DnsChangerLite.csproj -c Release --no-restore -p:Version=${{ inputs.version }}
+
+      - name: Verify Artifact
+        shell: pwsh
+        run: |
+          $exe = "src/DnsChangerLite/bin/Release/net48/DnsChangerLite.exe"
+          if (!(Test-Path $exe)) { throw "EXE not found at $exe" }
+          $item = Get-Item $exe
+          Write-Host "EXE: $($item.FullName)"
+          Write-Host "Size: $([math]::Round($item.Length / 1KB, 1)) KB"
+          $hash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          Write-Host "SHA256: $hash"
+          $hash | Out-File -FilePath "$env:RUNNER_TEMP/sha256.txt" -Encoding ascii
+          if ($item.Length -ge 10MB) { throw "EXE exceeds 10 MB limit" }
+          # Verify elevation manifest is embedded
+          $bytes = [System.IO.File]::ReadAllBytes($exe)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          if ($text -notmatch "requireAdministrator") { throw "UAC manifest not embedded" }
+          # Verify version stamped into assembly
+          $fileVersion = (Get-Item $exe).VersionInfo.FileVersion
+          if ($fileVersion -ne "${{ inputs.version }}.0") { throw "Assembly version mismatch: $fileVersion" }
+          Write-Host "✓ All artifact checks passed"
+
+      - name: Stage Release Files
+        shell: pwsh
+        run: |
+          $stage = "$env:RUNNER_TEMP/release"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "src/DnsChangerLite/bin/Release/net48/DnsChangerLite.exe" "$stage/DnsChangerLite-v${{ inputs.version }}.exe"
+          Copy-Item "$env:RUNNER_TEMP/sha256.txt" "$stage/sha256.txt"
+          Get-ChildItem $stage
+          "STAGE_DIR=$stage" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DnsChangerLite-v${{ inputs.version }}
+          path: ${{ env.STAGE_DIR }}/*
+          if-no-files-found: error
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ inputs.version }}
+          name: DNS Changer Lite v${{ inputs.version }}
+          body: |
+            ## DNS Changer Lite v${{ inputs.version }}
+
+            Lightweight DNS changer for Windows 10/11 — one click, done.
+
+            ### Downloads
+            | File | Description |
+            |:---|:---|
+            | `DnsChangerLite-v${{ inputs.version }}.exe` | Portable app — single file, no installer |
+            | `sha256.txt` | SHA-256 checksum for verification |
+
+            ### Install
+            1. Download `DnsChangerLite-v${{ inputs.version }}.exe`
+            2. Run it (UAC prompt will appear — admin required)
+            3. Select adapter → pick preset → **Apply DNS**
+
+            ### Requirements
+            - Windows 10 / 11
+            - .NET Framework 4.8 (pre-installed)
+
+            ---
+            **Full changelog:** generated from commit history
+          draft: false
+          prerelease: false
+          files: |
+            ${{ env.STAGE_DIR }}/DnsChangerLite-v${{ inputs.version }}.exe
+            ${{ env.STAGE_DIR }}/sha256.txt
